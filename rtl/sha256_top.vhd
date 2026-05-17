@@ -2,9 +2,9 @@
 -- File         : sha256_top.vhd
 -- Description  : Top-level SHA-256 co-processor with DMA-style memory access.
 --
--- Memory layout (starting at BASE_ADDR, active-low byte-enable):
+-- Memory layout (starting at BASE_ADDR):
 --   Offset 0:   LEN  (message length in bytes, 32-bit)
---   Offset 4:   M[0] (first message word, big-endian)
+--   Offset 4:   M[0] (first message word, big-endian after byte-swap)
 --   Offset 8:   M[1]
 --   ...
 --
@@ -13,15 +13,7 @@
 --   Stage 2:  Store into W window / expand
 --   Stage 3:  SHA-256 round computation
 --
--- After compression, the 256-bit digest is available on digest_out.
---
--- Control:
---   start='1' pulse  -> begin hashing
---   done='1'         -> digest is valid, unit is idle
---
--- Bus interface:
---   Simple read-only master: mem_addr, mem_read, mem_rdata, mem_valid.
---   Co-processor drives addr + read; memory responds with rdata + valid.
+-- Simplified FSM: IDLE -> INIT -> FETCH -> DRAIN -> FINALIZE
 --------------------------------------------------------------------------------
 
 library ieee;
@@ -57,43 +49,42 @@ end entity sha256_top;
 architecture rtl of sha256_top is
 
     ---------------------------------------------------------------------------
-    -- FSM states
+    -- FSM states (5 total)
     ---------------------------------------------------------------------------
     type state_t is (
-        S_IDLE,
-        S_READ_LEN,
-        S_WAIT_LEN,
-        S_INIT,
-        S_FETCH,
-        S_WAIT_FETCH,
-        S_PIPE,         -- pipeline active: store + round overlap
-        S_DRAIN,        -- pipeline draining: rounds continue after fetch done
-        S_FINALIZE,
-        S_DONE
+        S_IDLE,       -- waiting for start, done='1'
+        S_INIT,       -- read LEN from memory + init a..h from H
+        S_FETCH,      -- fetch/pad words into schedule + run rounds
+        S_DRAIN,      -- schedule expands via sigma, rounds continue
+        S_FINALIZE    -- H += a..h, assert done or loop for next block
     );
-    signal state, next_state : state_t := S_IDLE;
+    signal state : state_t := S_IDLE;
 
     ---------------------------------------------------------------------------
     -- Counters and control
     ---------------------------------------------------------------------------
     signal msg_len_bytes : unsigned(31 downto 0) := (others => '0');
     signal msg_len_bits  : unsigned(63 downto 0) := (others => '0');
-    signal word_cnt      : unsigned(5 downto 0)  := (others => '0'); -- counts words fetched (0..15 per block)
-    signal round_cnt     : unsigned(6 downto 0)  := (others => '0'); -- 0..63 per block
-    signal total_words   : unsigned(31 downto 0) := (others => '0'); -- ceil(msg_len_bytes/4)
-    signal words_read    : unsigned(31 downto 0) := (others => '0'); -- total words read so far
+    signal total_words   : unsigned(31 downto 0) := (others => '0');
+    signal words_read    : unsigned(31 downto 0) := (others => '0');
     signal addr_reg      : unsigned(31 downto 0) := (others => '0');
+    signal word_cnt      : unsigned(5 downto 0)  := (others => '0');
+    signal round_cnt     : unsigned(6 downto 0)  := (others => '0');
+    signal block_word_idx: unsigned(3 downto 0)  := (others => '0');
+    signal len_received  : std_logic := '0';
+    signal init_done     : std_logic := '0';
+    signal pad_0x80_done : std_logic := '0';
+    signal need_extra_blk: std_logic := '0';
 
     ---------------------------------------------------------------------------
-    -- H register (running hash) and working variables a..h
+    -- H register (running hash) and working variables
     ---------------------------------------------------------------------------
     signal H_reg : word_8 := H_INIT;
-
     signal va, vb, vc, vd, ve, vf, vg, vh : word := (others => '0');
     signal na, nb, nc, nd, ne, nf, ng, nh : word;
 
     ---------------------------------------------------------------------------
-    -- Schedule interface signals
+    -- Schedule interface
     ---------------------------------------------------------------------------
     signal sched_load_en  : std_logic := '0';
     signal sched_shift_en : std_logic := '0';
@@ -101,15 +92,7 @@ architecture rtl of sha256_top is
     signal sched_wt       : word;
 
     ---------------------------------------------------------------------------
-    -- Padding logic signals
-    ---------------------------------------------------------------------------
-    signal pad_word       : word;
-    signal use_pad        : std_logic := '0';
-    signal pad_0x80_done  : std_logic := '0';
-    signal block_word_idx : unsigned(3 downto 0) := (others => '0'); -- 0..15 within block
-
-    ---------------------------------------------------------------------------
-    -- Byte-swap function (little-endian memory -> big-endian SHA word)
+    -- Byte-swap (little-endian RISC-V -> big-endian SHA)
     ---------------------------------------------------------------------------
     function byte_swap(x : std_logic_vector(31 downto 0)) return word is
     begin
@@ -145,11 +128,9 @@ begin
         );
 
     ---------------------------------------------------------------------------
-    -- Main FSM process
+    -- Main FSM
     ---------------------------------------------------------------------------
     process (clk)
-        variable remaining_bytes : unsigned(31 downto 0);
-        variable block_byte_pos  : unsigned(5 downto 0);  -- byte position within 64-byte block
     begin
         if rising_edge(clk) then
             if rst = '1' then
@@ -161,165 +142,135 @@ begin
                 word_cnt       <= (others => '0');
                 words_read     <= (others => '0');
                 pad_0x80_done  <= '0';
+                len_received   <= '0';
+                init_done      <= '0';
                 sched_shift_en <= '0';
                 sched_load_en  <= '0';
             else
-                -- Defaults
+                -- Defaults each cycle
                 mem_read       <= '0';
                 sched_shift_en <= '0';
                 sched_load_en  <= '0';
 
                 case state is
 
-                    --------------------------------------------------------
-                    -- IDLE: wait for start
-                    --------------------------------------------------------
+                    ----------------------------------------------------
+                    -- S_IDLE: wait for start pulse
+                    ----------------------------------------------------
                     when S_IDLE =>
                         done <= '1';
                         if start = '1' then
-                            done      <= '0';
-                            state     <= S_READ_LEN;
-                            addr_reg  <= BASE_ADDR;
-                            mem_read  <= '1';
-                            H_reg     <= H_INIT;
+                            done          <= '0';
+                            state         <= S_INIT;
+                            addr_reg      <= BASE_ADDR;
+                            H_reg         <= H_INIT;
                             words_read    <= (others => '0');
                             pad_0x80_done <= '0';
+                            len_received  <= '0';
+                            init_done     <= '0';
+                            need_extra_blk <= '0';
+                            mem_read      <= '1';
                         end if;
 
-                    --------------------------------------------------------
-                    -- READ_LEN: put address on bus, wait for valid
-                    --------------------------------------------------------
-                    when S_READ_LEN =>
-                        mem_read <= '1';
-                        state    <= S_WAIT_LEN;
-
-                    --------------------------------------------------------
-                    -- WAIT_LEN: read the length word
-                    --------------------------------------------------------
-                    when S_WAIT_LEN =>
-                        mem_read <= '1';
-                        if mem_valid = '1' then
-                            msg_len_bytes <= unsigned(mem_rdata);
-                            msg_len_bits  <= unsigned(mem_rdata) & x"00000000";
-                            -- msg_len_bits = msg_len_bytes * 8 (shift left 3)
-                            msg_len_bits  <= shift_left(resize(unsigned(mem_rdata), 64), 3);
-                            total_words   <= shift_right(unsigned(mem_rdata) + 3, 2); -- ceil(len/4)
-                            addr_reg      <= BASE_ADDR + 4;  -- first message word
-                            state         <= S_INIT;
-                            mem_read      <= '0';
-                        end if;
-
-                    --------------------------------------------------------
-                    -- INIT: initialize working variables from H
-                    --------------------------------------------------------
+                    ----------------------------------------------------
+                    -- S_INIT: read LEN + initialize working variables
+                    --   Stays here until LEN is received, then loads
+                    --   a..h from H and transitions to S_FETCH.
+                    ----------------------------------------------------
                     when S_INIT =>
-                        va <= H_reg(0);  vb <= H_reg(1);
-                        vc <= H_reg(2);  vd <= H_reg(3);
-                        ve <= H_reg(4);  vf <= H_reg(5);
-                        vg <= H_reg(6);  vh <= H_reg(7);
-                        word_cnt      <= (others => '0');
-                        round_cnt     <= (others => '0');
-                        block_word_idx <= (others => '0');
-                        state         <= S_FETCH;
+                        if len_received = '0' then
+                            -- Waiting for memory to return LEN
+                            mem_read <= '1';
+                            if mem_valid = '1' then
+                                msg_len_bytes <= unsigned(mem_rdata);
+                                msg_len_bits  <= shift_left(resize(unsigned(mem_rdata), 64), 3);
+                                total_words   <= shift_right(unsigned(mem_rdata) + 3, 2);
+                                addr_reg      <= BASE_ADDR + 4;
+                                len_received  <= '1';
+                            end if;
+                        else
+                            -- LEN known: init working variables
+                            va <= H_reg(0);  vb <= H_reg(1);
+                            vc <= H_reg(2);  vd <= H_reg(3);
+                            ve <= H_reg(4);  vf <= H_reg(5);
+                            vg <= H_reg(6);  vh <= H_reg(7);
+                            word_cnt       <= (others => '0');
+                            round_cnt      <= (others => '0');
+                            block_word_idx <= (others => '0');
+                            state          <= S_FETCH;
+                            mem_read       <= '1';
+                        end if;
 
-                    --------------------------------------------------------
-                    -- FETCH: issue memory read (or generate pad word)
-                    --------------------------------------------------------
+                    ----------------------------------------------------
+                    -- S_FETCH: fetch message words or generate padding.
+                    --   Each time mem_valid='1' (or padding generated),
+                    --   push word into schedule + run a round if primed.
+                    --   After 16 words in this block -> S_DRAIN.
+                    ----------------------------------------------------
                     when S_FETCH =>
                         if words_read < total_words then
-                            -- Real message data still to fetch
-                            mem_addr <= std_logic_vector(addr_reg);
+                            -- Still real message data to fetch
                             mem_read <= '1';
-                            state    <= S_WAIT_FETCH;
-                        else
-                            -- Past end of message: generate padding
-                            use_pad <= '1';
-                            state   <= S_PIPE;
-                        end if;
+                            if mem_valid = '1' then
+                                sched_m_in     <= byte_swap(mem_rdata);
+                                sched_load_en  <= '1';
+                                sched_shift_en <= '1';
+                                addr_reg       <= addr_reg + 4;
+                                words_read     <= words_read + 1;
+                                word_cnt       <= word_cnt + 1;
+                                block_word_idx <= block_word_idx + 1;
 
-                    --------------------------------------------------------
-                    -- WAIT_FETCH: wait for memory valid
-                    --------------------------------------------------------
-                    when S_WAIT_FETCH =>
-                        mem_addr <= std_logic_vector(addr_reg);
-                        mem_read <= '1';
-                        if mem_valid = '1' then
-                            sched_m_in     <= byte_swap(mem_rdata);
+                                -- Run round once pipeline is primed
+                                if word_cnt >= 2 then
+                                    va <= na; vb <= nb; vc <= nc; vd <= nd;
+                                    ve <= ne; vf <= nf; vg <= ng; vh <= nh;
+                                    round_cnt <= round_cnt + 1;
+                                end if;
+
+                                -- Block full? -> drain
+                                if block_word_idx = 15 then
+                                    state <= S_DRAIN;
+                                end if;
+                            end if;
+                        else
+                            -- Past message end: generate padding word
+                            if pad_0x80_done = '0' then
+                                sched_m_in    <= x"80000000";
+                                pad_0x80_done <= '1';
+                            elsif block_word_idx = 14 then
+                                sched_m_in <= std_logic_vector(msg_len_bits(63 downto 32));
+                            elsif block_word_idx = 15 then
+                                sched_m_in <= std_logic_vector(msg_len_bits(31 downto 0));
+                            else
+                                sched_m_in <= (others => '0');
+                            end if;
+
                             sched_load_en  <= '1';
                             sched_shift_en <= '1';
-                            addr_reg       <= addr_reg + 4;
-                            words_read     <= words_read + 1;
                             word_cnt       <= word_cnt + 1;
                             block_word_idx <= block_word_idx + 1;
 
-                            -- Start round if pipeline is primed (word_cnt >= 2)
+                            -- Run round once pipeline is primed
                             if word_cnt >= 2 then
                                 va <= na; vb <= nb; vc <= nc; vd <= nd;
                                 ve <= ne; vf <= nf; vg <= ng; vh <= nh;
                                 round_cnt <= round_cnt + 1;
                             end if;
 
-                            -- Decide next state
+                            -- Block full? -> drain
                             if block_word_idx = 15 then
                                 state <= S_DRAIN;
-                            else
-                                state <= S_FETCH;
                             end if;
-                            mem_read <= '0';
                         end if;
 
-                    --------------------------------------------------------
-                    -- PIPE: padding word goes into schedule + round runs
-                    --------------------------------------------------------
-                    when S_PIPE =>
-                        -- Generate padding word
-                        remaining_bytes := msg_len_bytes - shift_left(words_read - 1, 2);
-                        block_byte_pos  := block_word_idx & "00";
-
-                        if pad_0x80_done = '0' then
-                            -- Need to insert 0x80 after last valid byte
-                            -- For simplicity: if we're here, the last real word
-                            -- was partial or done. Insert 0x80000000 for the
-                            -- first padding word.
-                            sched_m_in    <= x"80000000";
-                            pad_0x80_done <= '1';
-                        elsif block_word_idx = 14 then
-                            -- Length high word (upper 32 bits of bit-length)
-                            sched_m_in <= std_logic_vector(msg_len_bits(63 downto 32));
-                        elsif block_word_idx = 15 then
-                            -- Length low word (lower 32 bits of bit-length)
-                            sched_m_in <= std_logic_vector(msg_len_bits(31 downto 0));
-                        else
-                            -- Zero padding
-                            sched_m_in <= (others => '0');
-                        end if;
-
-                        sched_load_en  <= '1';
-                        sched_shift_en <= '1';
-                        word_cnt       <= word_cnt + 1;
-                        block_word_idx <= block_word_idx + 1;
-
-                        -- Run round
-                        if word_cnt >= 2 then
-                            va <= na; vb <= nb; vc <= nc; vd <= nd;
-                            ve <= ne; vf <= nf; vg <= ng; vh <= nh;
-                            round_cnt <= round_cnt + 1;
-                        end if;
-
-                        -- Check if block is full
-                        if block_word_idx = 15 then
-                            state <= S_DRAIN;
-                        end if;
-
-                    --------------------------------------------------------
-                    -- DRAIN: no more fetches; schedule expands + rounds run
-                    --------------------------------------------------------
+                    ----------------------------------------------------
+                    -- S_DRAIN: schedule self-expands, rounds continue.
+                    --   No memory access. Runs until round 63.
+                    ----------------------------------------------------
                     when S_DRAIN =>
-                        -- Schedule generates W via sigma expansion
                         sched_load_en  <= '0';
                         sched_shift_en <= '1';
 
-                        -- Run round
                         va <= na; vb <= nb; vc <= nc; vd <= nd;
                         ve <= ne; vf <= nf; vg <= ng; vh <= nh;
                         round_cnt <= round_cnt + 1;
@@ -328,9 +279,9 @@ begin
                             state <= S_FINALIZE;
                         end if;
 
-                    --------------------------------------------------------
-                    -- FINALIZE: add working variables to H, check if more blocks
-                    --------------------------------------------------------
+                    ----------------------------------------------------
+                    -- S_FINALIZE: H += a..h. Then done or next block.
+                    ----------------------------------------------------
                     when S_FINALIZE =>
                         H_reg(0) <= std_logic_vector(unsigned(H_reg(0)) + unsigned(va));
                         H_reg(1) <= std_logic_vector(unsigned(H_reg(1)) + unsigned(vb));
@@ -341,29 +292,20 @@ begin
                         H_reg(6) <= std_logic_vector(unsigned(H_reg(6)) + unsigned(vg));
                         H_reg(7) <= std_logic_vector(unsigned(H_reg(7)) + unsigned(vh));
 
-                        -- If there's more data or padding still needed for another block
-                        if (words_read < total_words) or (pad_0x80_done = '0') then
-                            state <= S_INIT;  -- start another block
-                        elsif block_word_idx /= 0 then
-                            -- Padding overflowed: need one more block
-                            -- (this happens when msg is 56-64 bytes mod 64)
+                        -- Check if more blocks needed
+                        if (words_read < total_words) then
+                            -- More message data to process
+                            len_received <= '1';  -- skip re-reading LEN
+                            state <= S_INIT;
+                        elsif (pad_0x80_done = '0') or (need_extra_blk = '1') then
+                            -- Need another block for padding overflow
+                            need_extra_blk <= '0';
+                            len_received <= '1';
                             state <= S_INIT;
                         else
-                            state <= S_DONE;
-                        end if;
-
-                    --------------------------------------------------------
-                    -- DONE: digest is valid
-                    --------------------------------------------------------
-                    when S_DONE =>
-                        done <= '1';
-                        if start = '1' then
-                            done  <= '0';
-                            state <= S_READ_LEN;
-                            addr_reg <= BASE_ADDR;
-                            mem_read <= '1';
-                            words_read    <= (others => '0');
-                            pad_0x80_done <= '0';
+                            -- All done
+                            done  <= '1';
+                            state <= S_IDLE;
                         end if;
 
                     when others =>
@@ -375,13 +317,13 @@ begin
     end process;
 
     ---------------------------------------------------------------------------
-    -- Output: concatenate H[0]..H[7] as the 256-bit digest
+    -- Output digest
     ---------------------------------------------------------------------------
     digest_out <= H_reg(0) & H_reg(1) & H_reg(2) & H_reg(3)
                & H_reg(4) & H_reg(5) & H_reg(6) & H_reg(7);
 
     ---------------------------------------------------------------------------
-    -- Memory address output (active when mem_read = '1')
+    -- Memory address (active when mem_read = '1')
     ---------------------------------------------------------------------------
     mem_addr <= std_logic_vector(addr_reg);
 
