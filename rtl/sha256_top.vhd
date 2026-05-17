@@ -65,6 +65,7 @@ architecture rtl of sha256_top is
     ---------------------------------------------------------------------------
     signal msg_len_bytes : unsigned(31 downto 0) := (others => '0');
     signal msg_len_bits  : unsigned(63 downto 0) := (others => '0');
+    signal tail_bytes    : unsigned(1 downto 0)  := (others => '0'); -- valid bytes in last word (0=4)
     signal total_words   : unsigned(31 downto 0) := (others => '0');
     signal words_read    : unsigned(31 downto 0) := (others => '0');
     signal addr_reg      : unsigned(31 downto 0) := (others => '0');
@@ -97,6 +98,33 @@ architecture rtl of sha256_top is
     function byte_swap(x : std_logic_vector(31 downto 0)) return word is
     begin
         return x(7 downto 0) & x(15 downto 8) & x(23 downto 16) & x(31 downto 24);
+    end function;
+
+    ---------------------------------------------------------------------------
+    -- Mask last word + inject 0x80
+    -- Given a big-endian word and the number of valid bytes (1,2,3),
+    -- zero out the invalid bytes and put 0x80 right after the last valid one.
+    --
+    --   valid_bytes=1: keep byte[31:24], inject 0x80 at [23:16], zero rest
+    --   valid_bytes=2: keep byte[31:16], inject 0x80 at [15:8],  zero rest
+    --   valid_bytes=3: keep byte[31:8],  inject 0x80 at [7:0]
+    --   valid_bytes=0: means all 4 are valid (word is full), 0x80 goes in NEXT word
+    ---------------------------------------------------------------------------
+    function mask_and_pad(x : word; valid_bytes : unsigned(1 downto 0)) return word is
+        variable result : word;
+    begin
+        case to_integer(valid_bytes) is
+            when 1 =>
+                result := x(31 downto 24) & x"800000";
+            when 2 =>
+                result := x(31 downto 16) & x"8000";
+            when 3 =>
+                result := x(31 downto 8) & x"80";
+            when others =>
+                -- 0 means full word — shouldn't call this, but return as-is
+                result := x;
+        end case;
+        return result;
     end function;
 
 begin
@@ -185,6 +213,9 @@ begin
                                 msg_len_bytes <= unsigned(mem_rdata);
                                 msg_len_bits  <= shift_left(resize(unsigned(mem_rdata), 64), 3);
                                 total_words   <= shift_right(unsigned(mem_rdata) + 3, 2);
+                                -- tail_bytes = msg_len_bytes mod 4 (how many valid bytes in last word)
+                                -- 0 means all 4 bytes are valid (full word)
+                                tail_bytes    <= unsigned(mem_rdata(1 downto 0));
                                 addr_reg      <= BASE_ADDR + 4;
                                 len_received  <= '1';
                             end if;
@@ -212,7 +243,16 @@ begin
                             -- Still real message data to fetch
                             mem_read <= '1';
                             if mem_valid = '1' then
-                                sched_m_in     <= byte_swap(mem_rdata);
+                                -- Check if this is the LAST message word
+                                if (words_read + 1 = total_words) and (tail_bytes /= 0) then
+                                    -- Last word is PARTIAL: mask + inject 0x80 inside it
+                                    sched_m_in    <= mask_and_pad(byte_swap(mem_rdata), tail_bytes);
+                                    pad_0x80_done <= '1';
+                                else
+                                    -- Full word (or last word that happens to be full)
+                                    sched_m_in <= byte_swap(mem_rdata);
+                                end if;
+
                                 sched_load_en  <= '1';
                                 sched_shift_en <= '1';
                                 addr_reg       <= addr_reg + 4;
@@ -233,15 +273,19 @@ begin
                                 end if;
                             end if;
                         else
-                            -- Past message end: generate padding word
+                            -- Past message end: generate padding words
                             if pad_0x80_done = '0' then
+                                -- Message length was multiple of 4: 0x80 goes in its own word
                                 sched_m_in    <= x"80000000";
                                 pad_0x80_done <= '1';
                             elsif block_word_idx = 14 then
+                                -- Upper 32 bits of 64-bit length (in bits)
                                 sched_m_in <= std_logic_vector(msg_len_bits(63 downto 32));
                             elsif block_word_idx = 15 then
+                                -- Lower 32 bits of 64-bit length (in bits)
                                 sched_m_in <= std_logic_vector(msg_len_bits(31 downto 0));
                             else
+                                -- Zero padding
                                 sched_m_in <= (others => '0');
                             end if;
 
